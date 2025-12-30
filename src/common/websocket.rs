@@ -2759,7 +2759,7 @@ mod tests {
         WebsocketHandler, WebsocketMessageSendOptions, WebsocketMode, WebsocketSessionLogonReq,
         WebsocketStream, WebsocketStreams, create_stream_handler,
     };
-    use crate::config::{ConfigurationWebsocketApi, ConfigurationWebsocketStreams, PrivateKey};
+    use crate::config::{ConfigurationWebsocketApi, ConfigurationWebsocketStreams};
     use crate::errors::{WebsocketConnectionFailureReason, WebsocketError};
     use crate::models::{StreamId, TimeUnit};
     use async_trait::async_trait;
@@ -2827,14 +2827,12 @@ mod tests {
         let auto_session_relogon = auto_session_relogon.unwrap_or(true);
         let sig_gen = SignatureGenerator::new(
             Some("api_secret".into()),
-            None::<PrivateKey>,
-            None::<String>,
+            None,
         );
         let config = ConfigurationWebsocketApi {
             api_key: Some("api_key".into()),
             api_secret: Some("api_secret".into()),
-            private_key: None,
-            private_key_passphrase: None,
+            ed25519_secret: None,
             ws_url: Some("wss://example.com".into()),
             mode,
             reconnect_delay: 1000,
@@ -4842,15 +4840,13 @@ mod tests {
 
                     let sig_gen = SignatureGenerator::new(
                         Some("api_secret".to_string()),
-                        None::<PrivateKey>,
-                        None::<String>,
+                        None
                     );
 
                     let config = ConfigurationWebsocketApi {
                         api_key: Some("api_key".to_string()),
                         api_secret: Some("api_secret".to_string()),
-                        private_key: None,
-                        private_key_passphrase: None,
+                        ed25519_secret: None,
                         ws_url: Some("wss://example".to_string()),
                         mode: WebsocketMode::Single,
                         reconnect_delay: 1000,
@@ -4886,14 +4882,12 @@ mod tests {
                     }
                     let sig = SignatureGenerator::new(
                         Some("api_secret".into()),
-                        None::<PrivateKey>,
-                        None::<String>,
+                        None
                     );
                     let cfg = ConfigurationWebsocketApi {
                         api_key: Some("api_key".into()),
                         api_secret: Some("api_secret".to_string()),
-                        private_key: None,
-                        private_key_passphrase: None,
+                        ed25519_secret: None,
                         ws_url: Some("ws://doesnotexist:1".to_string()),
                         mode: WebsocketMode::Single,
                         reconnect_delay: 0,
@@ -4921,14 +4915,12 @@ mod tests {
                     }
                     let sig = SignatureGenerator::new(
                         Some("api_secret".to_string()),
-                        None::<PrivateKey>,
-                        None::<String>,
+                        None
                     );
                     let cfg = ConfigurationWebsocketApi {
                         api_key: Some("api_key".to_string()),
                         api_secret: Some("api_secret".to_string()),
-                        private_key: None,
-                        private_key_passphrase: None,
+                        ed25519_secret: None,
                         ws_url: Some("ws://example.com".to_string()),
                         mode: WebsocketMode::Single,
                         reconnect_delay: 0,
@@ -4951,14 +4943,12 @@ mod tests {
                     let conn = WebsocketConnection::new("id1");
                     let sig = SignatureGenerator::new(
                         Some("api_secret".to_string()),
-                        None::<PrivateKey>,
-                        None::<String>,
+                        None
                     );
                     let cfg = ConfigurationWebsocketApi {
                         api_key: Some("api_key".to_string()),
                         api_secret: Some("api_secret".to_string()),
-                        private_key: None,
-                        private_key_passphrase: None,
+                        ed25519_secret: None,
                         ws_url: Some("ws://127.0.0.1:9".to_string()),
                         mode: WebsocketMode::Single,
                         reconnect_delay: 0,
@@ -4981,14 +4971,12 @@ mod tests {
                     let conn = WebsocketConnection::new("id3");
                     let sig = SignatureGenerator::new(
                         Some("api_secret".to_string()),
-                        None::<PrivateKey>,
-                        None::<String>,
+                        None
                     );
                     let cfg = ConfigurationWebsocketApi {
                         api_key: Some("api_key".to_string()),
                         api_secret: Some("api_secret".to_string()),
-                        private_key: None,
-                        private_key_passphrase: None,
+                        ed25519_secret: None,
                         ws_url: Some("wss://invalid-domain".to_string()),
                         mode: WebsocketMode::Single,
                         reconnect_delay: 0,
@@ -5016,14 +5004,12 @@ mod tests {
                     let conn = WebsocketConnection::new("w");
                     let sig = SignatureGenerator::new(
                         Some("api_secret".to_string()),
-                        None::<PrivateKey>,
-                        None::<String>,
+                        None
                     );
                     let cfg = ConfigurationWebsocketApi {
                         api_key: Some("api_key".into()),
                         api_secret: Some("api_secret".to_string()),
-                        private_key: None,
-                        private_key_passphrase: None,
+                        ed25519_secret: None,
                         ws_url: Some("ws://doesnotexist:1".to_string()),
                         mode: WebsocketMode::Single,
                         reconnect_delay: 0,
@@ -5637,14 +5623,12 @@ mod tests {
             fn create_websocket_api_and_conn() -> (Arc<WebsocketApi>, Arc<WebsocketConnection>) {
                 let sig_gen = SignatureGenerator::new(
                     Some("api_secret".to_string()),
-                    None::<_>,
-                    None::<String>,
+                    None
                 );
                 let config = ConfigurationWebsocketApi {
                     api_key: Some("api_key".to_string()),
                     api_secret: Some("api_secret".to_string()),
-                    private_key: None,
-                    private_key_passphrase: None,
+                    ed25519_secret: None,
                     ws_url: Some("wss://example".to_string()),
                     mode: WebsocketMode::Single,
                     reconnect_delay: 0,
@@ -5809,14 +5793,12 @@ mod tests {
             fn create_websocket_api_and_conn() -> (Arc<WebsocketApi>, Arc<WebsocketConnection>) {
                 let sig_gen = SignatureGenerator::new(
                     Some("api_secret".to_string()),
-                    None::<_>,
-                    None::<String>,
+                    None
                 );
                 let config = ConfigurationWebsocketApi {
                     api_key: Some("api_key".to_string()),
                     api_secret: Some("api_secret".to_string()),
-                    private_key: None,
-                    private_key_passphrase: None,
+                    ed25519_secret: None,
                     ws_url: Some("wss://example".to_string()),
                     mode: WebsocketMode::Single,
                     reconnect_delay: 0,

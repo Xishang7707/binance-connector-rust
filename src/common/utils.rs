@@ -1,17 +1,15 @@
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose};
-use ed25519_dalek::Signer as Ed25519Signer;
+use base64::{engine::general_purpose, Engine as _};
 use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::DecodePrivateKey;
+use ed25519_dalek::{Signature, Signer as Ed25519Signer};
 use flate2::read::GzDecoder;
 use hex;
 use hmac::{Hmac, Mac};
+use http::header::ACCEPT_ENCODING;
 use http::HeaderMap;
 use http::HeaderValue;
-use http::header::ACCEPT_ENCODING;
 use once_cell::sync::OnceCell;
-use openssl::{hash::MessageDigest, pkey::PKey, sign::Signer as OpenSslSigner};
-use rand::{RngCore, rngs::OsRng};
+use rand::{rngs::OsRng, RngCore};
 use regex::Captures;
 use regex::Regex;
 use reqwest::Client;
@@ -19,7 +17,7 @@ use reqwest::Proxy;
 use reqwest::{Method, Request};
 use serde::de::DeserializeOwned;
 use serde_json::Number;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::Sha256;
 use std::fmt::Display;
 use std::hash::BuildHasher;
@@ -27,7 +25,6 @@ use std::sync::LazyLock;
 use std::{
     collections::BTreeMap,
     collections::HashMap,
-    fs,
     io::Read,
     path::Path,
     time::Duration,
@@ -36,11 +33,9 @@ use std::{
 use tokio::time::sleep;
 use tracing::info;
 use url::form_urlencoded;
-use url::{Url, form_urlencoded::Serializer};
+use url::{form_urlencoded::Serializer, Url};
 
-use super::config::{
-    ConfigurationRestApi, ConfigurationWebsocketApi, HttpAgent, PrivateKey, ProxyConfig,
-};
+use super::config::{ConfigurationRestApi, ConfigurationWebsocketApi, HttpAgent, ProxyConfig};
 use super::errors::ConnectorError;
 use super::models::{
     Interval, RateLimitType, RestApiRateLimit, RestApiResponse, StreamId, TimeUnit,
@@ -51,6 +46,7 @@ pub(crate) static ID_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[0-9a-f]{32}$").unwrap());
 static PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(@)?<([^>]+)>").unwrap());
 
+type HmacSha256 = Hmac<Sha256>;
 /// A generator for creating cryptographic signatures with support for various key types and configurations.
 ///
 /// This struct manages different authentication mechanisms including API secrets, private keys,
@@ -67,115 +63,48 @@ static PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(@)?<([^>
 /// * `ed25519_signing_key`: Lazily initialized Ed25519 signing key
 #[derive(Debug, Default, Clone)]
 pub struct SignatureGenerator {
+    // HMAC（Binance REST）
     api_secret: Option<String>,
-    private_key: Option<PrivateKey>,
-    private_key_passphrase: Option<String>,
-    raw_key_data: OnceCell<String>,
-    key_object: OnceCell<PKey<openssl::pkey::Private>>,
-    ed25519_signing_key: OnceCell<SigningKey>,
+    hmac: OnceCell<HmacSha256>,
+
+    // Ed25519（如果需要）
+    ed25519_secret: Option<[u8; 32]>,
+    ed25519_key: OnceCell<SigningKey>,
 }
 
 impl SignatureGenerator {
     #[must_use]
-    pub fn new(
-        api_secret: Option<String>,
-        private_key: Option<PrivateKey>,
-        private_key_passphrase: Option<String>,
-    ) -> Self {
-        SignatureGenerator {
+    pub fn new(api_secret: Option<String>, ed25519_secret: Option<[u8; 32]>) -> Self {
+        Self {
             api_secret,
-            private_key,
-            private_key_passphrase,
-            raw_key_data: OnceCell::new(),
-            key_object: OnceCell::new(),
-            ed25519_signing_key: OnceCell::new(),
+            hmac: OnceCell::new(),
+            ed25519_secret,
+            ed25519_key: OnceCell::new(),
         }
     }
 
-    /// Retrieves the raw key data from a private key source.
-    ///
-    /// This method lazily initializes the raw key data by reading it from either a file path
-    /// or a raw byte array. If the key is from a file, it checks for file existence before reading.
-    /// If the key is provided as raw bytes, it converts them to a UTF-8 string.
-    ///
-    /// # Returns
-    /// A reference to the raw key data as a `String`.
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - No private key is provided
-    /// - The private key file does not exist
-    /// - The private key file cannot be read
-    fn get_raw_key_data(&self) -> Result<&String> {
-        self.raw_key_data.get_or_try_init(|| {
-            let pk = self
-                .private_key
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("No private_key provided"))?;
-            match pk {
-                PrivateKey::File(path) => {
-                    if Path::new(path).exists() {
-                        fs::read_to_string(path)
-                            .with_context(|| format!("Failed to read private key file: {path}"))
-                    } else {
-                        Err(anyhow::anyhow!("Private key file does not exist: {}", path))
-                    }
-                }
-                PrivateKey::Raw(bytes) => Ok(String::from_utf8_lossy(bytes).to_string()),
-            }
-        })
+    pub fn sign_hmac(&self, payload: &str) -> String {
+        let secret = self.api_secret.as_ref().expect("api_secret missing");
+
+        let mac = self.hmac.get_or_init(|| {
+            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC init failed")
+        });
+
+        let mut mac = mac.clone();
+        mac.update(payload.as_bytes());
+
+        hex::encode(mac.finalize().into_bytes())
     }
 
-    /// Retrieves the private key object, lazily initializing it from raw key data.
-    ///
-    /// This method attempts to parse the private key from PEM format, supporting both
-    /// passphrase-protected and unprotected keys. It uses the raw key data obtained
-    /// from `get_raw_key_data()` and attempts to create an OpenSSL private key object.
-    ///
-    /// # Returns
-    /// A reference to the parsed private key as a `PKey<openssl::pkey::Private>`.
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - The key cannot be parsed from PEM format
-    /// - A passphrase is required but incorrect
-    /// - The key data is invalid
-    fn get_key_object(&self) -> Result<&PKey<openssl::pkey::Private>> {
-        self.key_object.get_or_try_init(|| {
-            let key_data = self.get_raw_key_data()?;
-            if let Some(pass) = self.private_key_passphrase.as_ref() {
-                PKey::private_key_from_pem_passphrase(key_data.as_bytes(), pass.as_bytes())
-                    .context("Failed to parse private key with passphrase")
-            } else {
-                PKey::private_key_from_pem(key_data.as_bytes())
-                    .context("Failed to parse private key")
-            }
-        })
-    }
+    pub fn sign_ed25519(&self, payload: &[u8]) -> Vec<u8> {
+        let secret = self.ed25519_secret.expect("ed25519 secret missing");
 
-    /// Retrieves the Ed25519 signing key, lazily initializing it from raw key data.
-    ///
-    /// This method attempts to parse an Ed25519 private key from a PEM-formatted input,
-    /// extracting the base64-encoded key material and converting it to a `SigningKey`.
-    ///
-    /// # Returns
-    /// A reference to the parsed Ed25519 signing key.
-    ///
-    /// # Errors
-    /// Returns an error if:
-    /// - The key cannot be base64 decoded
-    /// - The key cannot be parsed from PKCS8 DER format
-    fn get_ed25519_signing_key(
-        &self,
-        key_obj: &PKey<openssl::pkey::Private>,
-    ) -> Result<&SigningKey> {
-        self.ed25519_signing_key.get_or_try_init(|| {
-            let der = key_obj
-                .private_key_to_der()
-                .context("Failed to export Ed25519 key to DER")?;
-            SigningKey::from_pkcs8_der(&der)
-                .map_err(|e| anyhow::anyhow!("Failed to parse Ed25519 key: {}", e))
-        })
+        let key = self
+            .ed25519_key
+            .get_or_init(|| SigningKey::from_bytes(&secret));
+
+        let sig: Signature = key.sign(payload);
+        sig.to_bytes().to_vec()
     }
 
     /// Generates a signature for the given query parameters using either HMAC-SHA256 or asymmetric key signing.
@@ -198,7 +127,6 @@ impl SignatureGenerator {
     ///
     /// # Supported Key Types
     /// - HMAC with API secret
-    /// - RSA private key
     /// - ED25519 private key
     pub fn get_signature(
         &self,
@@ -217,44 +145,18 @@ impl SignatureGenerator {
             query_str
         };
 
-        if self.private_key.is_none() {
-            if let Some(secret) = self.api_secret.as_ref() {
-                let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-                    .context("HMAC key initialization failed")?;
-                mac.update(params.as_bytes());
-                let result = mac.finalize().into_bytes();
-                return Ok(hex::encode(result));
-            }
+        if self.api_secret.is_some() {
+            let result = self.sign_hmac(&params);
+            return Ok(result);
         }
 
-        if self.private_key.is_some() {
-            let key_obj = self.get_key_object()?;
-            match key_obj.id() {
-                openssl::pkey::Id::RSA => {
-                    let mut signer = OpenSslSigner::new(MessageDigest::sha256(), key_obj)
-                        .context("Failed to create RSA signer")?;
-                    signer
-                        .update(params.as_bytes())
-                        .context("Failed to update RSA signer")?;
-                    let sig = signer.sign_to_vec().context("RSA signing failed")?;
-                    return Ok(general_purpose::STANDARD.encode(sig));
-                }
-                openssl::pkey::Id::ED25519 => {
-                    let signing_key = self.get_ed25519_signing_key(key_obj)?;
-                    let signature = signing_key.sign(params.as_bytes());
-                    return Ok(general_purpose::STANDARD.encode(signature.to_bytes()));
-                }
-                other => {
-                    return Err(anyhow::anyhow!(
-                        "Unsupported private key type: {:?}. Must be RSA or ED25519.",
-                        other
-                    ));
-                }
-            }
+        if self.ed25519_secret.is_some() {
+            let signature = self.sign_ed25519(params.as_bytes());
+            return Ok(general_purpose::STANDARD.encode(signature));
         }
 
         Err(anyhow::anyhow!(
-            "Either 'api_secret' or 'private_key' must be provided for signed requests."
+            "Either 'api_secret' or 'ed25519_secret' must be provided for signed requests."
         ))
     }
 }
@@ -1359,7 +1261,7 @@ mod tests {
         use std::collections::BTreeMap;
 
         use anyhow::Result;
-        use serde_json::{Value, json};
+        use serde_json::{json, Value};
         use url::form_urlencoded::Serializer;
 
         use crate::common::utils::build_query_string;
@@ -1580,18 +1482,17 @@ mod tests {
     }
 
     mod signature_generator {
-        use base64::{Engine, engine::general_purpose};
-        use ed25519_dalek::{SigningKey, ed25519::signature::SignerMut, pkcs8::DecodePrivateKey};
+        use base64::{engine::general_purpose, Engine};
+        use ed25519_dalek::{Signer, SigningKey};
         use hex;
         use hmac::{Hmac, Mac};
-        use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa, sign::Verifier};
+        use rand::rngs::OsRng;
+        use rand::RngCore;
         use serde_json::Value;
         use sha2::Sha256;
         use std::collections::BTreeMap;
-        use std::io::Write;
-        use tempfile::NamedTempFile;
 
-        use crate::{common::utils::SignatureGenerator, config::PrivateKey};
+        use crate::common::utils::SignatureGenerator;
 
         #[test]
         fn hmac_sha256_signature() {
@@ -1599,7 +1500,7 @@ mod tests {
             params.insert("b".into(), Value::Number(2.into()));
             params.insert("a".into(), Value::Number(1.into()));
 
-            let signature_gen = SignatureGenerator::new(Some("test-secret".into()), None, None);
+            let signature_gen = SignatureGenerator::new(Some("test-secret".into()), None);
             let sig = signature_gen
                 .get_signature(&params, None)
                 .expect("HMAC signing failed");
@@ -1622,7 +1523,7 @@ mod tests {
             body_params.insert("d".into(), Value::Number(4.into()));
             body_params.insert("c".into(), Value::Number(3.into()));
 
-            let signature_gen = SignatureGenerator::new(Some("test-secret".into()), None, None);
+            let signature_gen = SignatureGenerator::new(Some("test-secret".into()), None);
             let sig = signature_gen
                 .get_signature(&query_params, Some(&body_params))
                 .expect("HMAC signing with body failed");
@@ -1643,70 +1544,7 @@ mod tests {
         fn repeated_hmac_signature() {
             let mut params = BTreeMap::new();
             params.insert("x".into(), Value::String("y".into()));
-            let signature_gen = SignatureGenerator::new(Some("abc".into()), None, None);
-            let s1 = signature_gen.get_signature(&params, None).unwrap();
-            let s2 = signature_gen.get_signature(&params, None).unwrap();
-            assert_eq!(s1, s2);
-        }
-
-        #[test]
-        fn rsa_signature_verification() {
-            let mut params = BTreeMap::new();
-            params.insert("a".into(), Value::Number(1.into()));
-            params.insert("b".into(), Value::Number(2.into()));
-
-            let rsa = Rsa::generate(2048).unwrap();
-            let priv_pem = rsa.private_key_to_pem().unwrap();
-            let pub_pem = rsa.public_key_to_pem_pkcs1().unwrap();
-
-            let signature_gen =
-                SignatureGenerator::new(None, Some(PrivateKey::Raw(priv_pem.clone())), None);
-            let sig = signature_gen
-                .get_signature(&params, None)
-                .expect("RSA signing failed");
-
-            let sig_bytes = general_purpose::STANDARD.decode(&sig).unwrap();
-            let pubkey = PKey::public_key_from_pem(&pub_pem).unwrap();
-            let mut verifier = Verifier::new(MessageDigest::sha256(), &pubkey).unwrap();
-            verifier.update(b"a=1&b=2").unwrap();
-            assert!(verifier.verify(&sig_bytes).unwrap());
-        }
-
-        #[test]
-        fn rsa_signature_verification_with_body() {
-            let mut query_params = BTreeMap::new();
-            query_params.insert("a".into(), Value::Number(1.into()));
-            query_params.insert("b".into(), Value::Number(2.into()));
-
-            let mut body_params = BTreeMap::new();
-            body_params.insert("c".into(), Value::Number(3.into()));
-            body_params.insert("d".into(), Value::Number(4.into()));
-
-            let rsa = Rsa::generate(2048).unwrap();
-            let priv_pem = rsa.private_key_to_pem().unwrap();
-            let pub_pem = rsa.public_key_to_pem_pkcs1().unwrap();
-
-            let signature_gen =
-                SignatureGenerator::new(None, Some(PrivateKey::Raw(priv_pem.clone())), None);
-            let sig = signature_gen
-                .get_signature(&query_params, Some(&body_params))
-                .expect("RSA signing with body failed");
-
-            let sig_bytes = general_purpose::STANDARD.decode(&sig).unwrap();
-            let pubkey = PKey::public_key_from_pem(&pub_pem).unwrap();
-            let mut verifier = Verifier::new(MessageDigest::sha256(), &pubkey).unwrap();
-            verifier.update(b"a=1&b=2c=3&d=4").unwrap();
-            assert!(verifier.verify(&sig_bytes).unwrap());
-        }
-
-        #[test]
-        fn repeated_rsa_signature() {
-            let mut params = BTreeMap::new();
-            params.insert("k".into(), Value::Number(5.into()));
-            let rsa = Rsa::generate(2048).unwrap();
-            let priv_pem = rsa.private_key_to_pem().unwrap();
-            let signature_gen =
-                SignatureGenerator::new(None, Some(PrivateKey::Raw(priv_pem)), None);
+            let signature_gen = SignatureGenerator::new(Some("abc".into()), None);
             let s1 = signature_gen.get_signature(&params, None).unwrap();
             let s2 = signature_gen.get_signature(&params, None).unwrap();
             assert_eq!(s1, s2);
@@ -1719,23 +1557,18 @@ mod tests {
             params.insert("b".into(), Value::Number(2.into()));
             let qs = "a=1&b=2";
 
-            let ed = PKey::generate_ed25519().unwrap();
-            let priv_pem = ed.private_key_to_pem_pkcs8().unwrap();
+            let mut secret = [0u8; 32];
+            OsRng.fill_bytes(&mut secret);
+            let signing_key = SigningKey::from_bytes(&secret);
+            let secret_bytes = signing_key.to_bytes();
 
-            let signature_gen =
-                SignatureGenerator::new(None, Some(PrivateKey::Raw(priv_pem.clone())), None);
+            let signature_gen = SignatureGenerator::new(None, Some(secret_bytes));
+
             let sig = signature_gen
                 .get_signature(&params, None)
                 .expect("Ed25519 signing failed");
 
-            let pem_str = String::from_utf8(priv_pem).unwrap();
-            let b64 = pem_str
-                .lines()
-                .filter(|l| !l.starts_with("-----"))
-                .collect::<String>();
-            let der = general_purpose::STANDARD.decode(b64).unwrap();
-            let mut sk = SigningKey::from_pkcs8_der(&der).unwrap();
-            let expected_bytes = sk.sign(qs.as_bytes()).to_bytes();
+            let expected_bytes = signing_key.sign(qs.as_bytes()).to_bytes();
             let expected_sig = general_purpose::STANDARD.encode(expected_bytes);
             assert_eq!(sig, expected_sig);
         }
@@ -1752,24 +1585,19 @@ mod tests {
             body_params.insert("d".into(), Value::Number(4.into()));
             let body_qs = "c=3&d=4";
 
-            let ed = PKey::generate_ed25519().unwrap();
-            let priv_pem = ed.private_key_to_pem_pkcs8().unwrap();
+            let mut secret = [0u8; 32];
+            OsRng.fill_bytes(&mut secret);
+            let signing_key = SigningKey::from_bytes(&secret);
+            let secret_bytes = signing_key.to_bytes();
 
-            let signature_gen =
-                SignatureGenerator::new(None, Some(PrivateKey::Raw(priv_pem.clone())), None);
+            let signature_gen = SignatureGenerator::new(None, Some(secret_bytes));
+
             let sig = signature_gen
                 .get_signature(&query_params, Some(&body_params))
                 .expect("Ed25519 signing with body failed");
 
-            let pem_str = String::from_utf8(priv_pem).unwrap();
-            let b64 = pem_str
-                .lines()
-                .filter(|l| !l.starts_with("-----"))
-                .collect::<String>();
-            let der = general_purpose::STANDARD.decode(b64).unwrap();
-            let mut sk = SigningKey::from_pkcs8_der(&der).unwrap();
             let payload = format!("{qs}{body_qs}");
-            let expected_bytes = sk.sign(payload.as_bytes()).to_bytes();
+            let expected_bytes = signing_key.sign(payload.as_bytes()).to_bytes();
             let expected_sig = general_purpose::STANDARD.encode(expected_bytes);
             assert_eq!(sig, expected_sig);
         }
@@ -1778,69 +1606,17 @@ mod tests {
         fn repeated_ed25519_signature() {
             let mut params = BTreeMap::new();
             params.insert("m".into(), Value::String("n".into()));
-            let ed = PKey::generate_ed25519().unwrap();
-            let priv_pem = ed.private_key_to_pem_pkcs8().unwrap();
-            let signature_gen =
-                SignatureGenerator::new(None, Some(PrivateKey::Raw(priv_pem.clone())), None);
+
+            let mut secret = [0u8; 32];
+            OsRng.fill_bytes(&mut secret);
+            let signing_key = SigningKey::from_bytes(&secret);
+            let secret_bytes = signing_key.to_bytes();
+
+            let signature_gen = SignatureGenerator::new(None, Some(secret_bytes));
+
             let s1 = signature_gen.get_signature(&params, None).unwrap();
             let s2 = signature_gen.get_signature(&params, None).unwrap();
             assert_eq!(s1, s2);
-        }
-
-        #[test]
-        fn file_based_key() {
-            let rsa = Rsa::generate(1024).unwrap();
-            let priv_pem = rsa.private_key_to_pem().unwrap();
-            let pub_pem = rsa.public_key_to_pem_pkcs1().unwrap();
-
-            let mut file = NamedTempFile::new().unwrap();
-            file.write_all(&priv_pem).unwrap();
-            let path = file.path().to_str().unwrap().to_string();
-
-            let mut params = BTreeMap::new();
-            params.insert("z".into(), Value::Number(9.into()));
-
-            let signature_gen = SignatureGenerator::new(None, Some(PrivateKey::File(path)), None);
-            let sig = signature_gen.get_signature(&params, None).unwrap();
-
-            let sig_bytes = general_purpose::STANDARD.decode(&sig).unwrap();
-            let pubkey = PKey::public_key_from_pem(&pub_pem).unwrap();
-            let mut verifier = Verifier::new(MessageDigest::sha256(), &pubkey).unwrap();
-            verifier.update(b"z=9").unwrap();
-            assert!(verifier.verify(&sig_bytes).unwrap());
-        }
-
-        #[test]
-        fn unsupported_key_type_error() {
-            let mut params = BTreeMap::new();
-            params.insert("x".into(), Value::String("y".into()));
-
-            let group =
-                openssl::ec::EcGroup::from_curve_name(openssl::nid::Nid::X9_62_PRIME256V1).unwrap();
-            let ec_key = openssl::ec::EcKey::generate(&group).unwrap();
-            let pkey_ec = PKey::from_ec_key(ec_key).unwrap();
-            let raw = pkey_ec.private_key_to_pem_pkcs8().unwrap();
-
-            let signature_gen = SignatureGenerator::new(None, Some(PrivateKey::Raw(raw)), None);
-            let err = signature_gen
-                .get_signature(&params, None)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("Unsupported private key type"));
-        }
-
-        #[test]
-        fn invalid_private_key_error() {
-            let mut params = BTreeMap::new();
-            params.insert("foo".into(), Value::String("bar".into()));
-
-            let signature_gen =
-                SignatureGenerator::new(None, Some(PrivateKey::Raw(b"not a key".to_vec())), None);
-            let err = signature_gen
-                .get_signature(&params, None)
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("Failed to parse private key"));
         }
 
         #[test]
@@ -1848,12 +1624,12 @@ mod tests {
             let mut params = BTreeMap::new();
             params.insert("a".into(), Value::Number(1.into()));
 
-            let signature_gen = SignatureGenerator::new(None, None, None);
+            let signature_gen = SignatureGenerator::new(None, None);
             let err = signature_gen
                 .get_signature(&params, None)
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("Either 'api_secret' or 'private_key' must be provided"));
+            assert!(err.contains("Either 'api_secret' or 'ed25519_secret' must be provided"));
         }
     }
 
@@ -2018,7 +1794,7 @@ mod tests {
     mod http_request {
         use std::io::Write;
 
-        use flate2::{Compression, write::GzEncoder};
+        use flate2::{write::GzEncoder, Compression};
         use httpmock::MockServer;
         use reqwest::{Client, Method, Request};
         use serde::Deserialize;
@@ -2914,7 +2690,7 @@ mod tests {
     }
 
     mod normalize_stream_id {
-        use crate::common::utils::{StreamId, normalize_stream_id};
+        use crate::common::utils::{normalize_stream_id, StreamId};
         use serde_json::Value;
 
         fn is_lower_hex32(s: &str) -> bool {
@@ -3289,12 +3065,12 @@ mod tests {
     }
 
     mod build_websocket_api_message {
-        use serde_json::{Value, json};
+        use serde_json::{json, Value};
         use std::collections::BTreeMap;
 
         use crate::{
             common::{
-                utils::{ID_REGEX, build_websocket_api_message, remove_empty_value},
+                utils::{build_websocket_api_message, remove_empty_value, ID_REGEX},
                 websocket::WebsocketMessageSendOptions,
             },
             config::ConfigurationWebsocketApi,

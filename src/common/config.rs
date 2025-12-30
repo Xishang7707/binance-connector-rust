@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio_tungstenite::Connector;
 
 use super::models::{ConfigBuildError, TimeUnit, WebsocketMode};
-use super::utils::{SignatureGenerator, build_client};
+use super::utils::{build_client, SignatureGenerator};
 
 #[derive(Clone)]
 pub struct AgentConnector(pub Connector);
@@ -86,10 +86,7 @@ pub struct ConfigurationRestApi {
     pub agent: Option<HttpAgent>,
 
     #[builder(setter(strip_option), default)]
-    pub private_key: Option<PrivateKey>,
-
-    #[builder(setter(strip_option), default)]
-    pub private_key_passphrase: Option<String>,
+    pub ed25519_secret: Option<[u8; 32]>,
 
     #[builder(setter(strip_option), default)]
     pub time_unit: Option<TimeUnit>,
@@ -129,11 +126,8 @@ impl ConfigurationRestApiBuilder {
             cfg.proxy.as_ref(),
             cfg.agent.clone(),
         );
-        cfg.signature_gen = SignatureGenerator::new(
-            cfg.api_secret.clone(),
-            cfg.private_key.clone(),
-            cfg.private_key_passphrase.clone(),
-        );
+        cfg.signature_gen =
+            SignatureGenerator::new(cfg.api_secret.clone(), cfg.ed25519_secret.clone());
 
         Ok(cfg)
     }
@@ -167,10 +161,7 @@ pub struct ConfigurationWebsocketApi {
     pub agent: Option<AgentConnector>,
 
     #[builder(setter(strip_option), default)]
-    pub private_key: Option<PrivateKey>,
-
-    #[builder(setter(strip_option), default)]
-    pub private_key_passphrase: Option<String>,
+    pub ed25519_secret: Option<[u8; 32]>,
 
     #[builder(setter(strip_option), default)]
     pub time_unit: Option<TimeUnit>,
@@ -219,11 +210,8 @@ impl ConfigurationWebsocketApiBuilder {
     ///
     pub fn build(self) -> Result<ConfigurationWebsocketApi, ConfigBuildError> {
         let mut cfg = self.try_build()?;
-        cfg.signature_gen = SignatureGenerator::new(
-            cfg.api_secret.clone(),
-            cfg.private_key.clone(),
-            cfg.private_key_passphrase.clone(),
-        );
+        cfg.signature_gen =
+            SignatureGenerator::new(cfg.api_secret.clone(), cfg.ed25519_secret.clone());
 
         Ok(cfg)
     }
