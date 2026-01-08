@@ -83,12 +83,12 @@ once_cell = "1.21"
   features = [ "serde", "v4" ]
 
   [dependencies.reqwest]
-  version = "^0.12"
-  features = [ "json", "multipart", "blocking",  "rustls-tls"]
+  version = "0.13.1"
+  features = [ "json", "multipart", "blocking",  "rustls"]
 
-  [dependencies.reqwest-middleware]
-  version = "^0.3"
-  features = [ "json", "multipart" ]
+#  [dependencies.reqwest-middleware]
+#  version = "^0.3"
+#  features = [ "json", "multipart" ]
 
   [dependencies.tokio]
   version = "^1.33"
@@ -100,7 +100,7 @@ once_cell = "1.21"
 
   [dependencies.tokio-tungstenite]
   version = "0.26"
-  features = [ "rustls" ]
+  features = [ "__rustls-tls" ]
 
   [dependencies.tokio-util]
   version = "^0.7"
@@ -115,7 +115,7 @@ once_cell = "1.21"
   features = [ "macros", "serde" ]
 
 [dev-dependencies]
-httpmock = "0.6"
+httpmock = {version =  "0.8.2", features = ["rustls"] }
 mockito = "1.2.0"
 tempfile = "3.20.0"
 futures-util = "0.3"
