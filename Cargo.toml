@@ -66,7 +66,7 @@ base64 = "^0.22"
 ring = "0.17.14"
 flate2 = "^1.0"
 derive_builder = "^0.10"
-tokio-native-tls = "^0.3"
+# tokio-native-tls = "^0.3"
 tokio-stream = "0.1"
 rand = "0.8"
 futures = "0.3"
@@ -84,7 +84,7 @@ once_cell = "1.21"
 
   [dependencies.reqwest]
   version = "^0.12"
-  features = [ "json", "multipart", "blocking" ]
+  features = [ "json", "multipart", "blocking",  "rustls-tls"]
 
   [dependencies.reqwest-middleware]
   version = "^0.3"
@@ -100,7 +100,7 @@ once_cell = "1.21"
 
   [dependencies.tokio-tungstenite]
   version = "0.26"
-  features = [ "native-tls" ]
+  features = [ "rustls" ]
 
   [dependencies.tokio-util]
   version = "^0.7"
